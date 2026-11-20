@@ -12,8 +12,10 @@
  *   · 流式思考等文本稳定 700ms 再翻；命中缓存/在途请求不重复发；
  *   · 翻译失败保留英文原文，5 分钟内不重试；
  *   · 原文节点只是被隐藏，随时可还原；卸载时全部还原并断开观察；
- *   · 工具折叠行走另一条路：只把 `data-tool` 里的英文 wire 工具名换成中文标签
- *     （`工具 · ops_bash · ls -la` → `执行命令 · ls -la`），参数/命令/路径一个字符都不改；
+ *   · 工具折叠行同样整行送去翻译（`工具 · ops_bash · ls -la` → `终端 · 执行命令 · 列出…`），
+ *     原文保留在 DOM 里只做隐藏，并挂到译文节点的 `title` 上——悬停即可看原文，
+ *     展开行里的 IN 参数仍是原始 JSON，命令随时可复制；翻译失败时退回中文工具名标签；
+ *     同时在飞的请求上限 3 个，流式行等参数稳定后再翻。
  *   · 3 秒后仍没有任何一行翻译成功时，打一条 error 级诊断（DSH 桌面端会把渲染进程的
  *     error 级 console 转发到 ~/.dsh/logs/desktop-next.log），便于定位是缺 sessionId、
  *     还是没匹配到思考行/预览锚点。健康的页面上不会输出这条诊断。
@@ -149,6 +151,8 @@ window.__ModuleLoader__.load({
     const SCAN_DEBOUNCE_MS = 120;
     /** 一直没有翻译成功时的诊断时刻（毫秒，自挂载起算）。 */
     const DIAGNOSE_AT_MS = [3000, 10000];
+    /** 同时在飞的翻译请求上限，避免一屏工具行一次性打爆翻译服务。 */
+    const MAX_CONCURRENT_REQUESTS = 3;
 
     /**
      * 判断文本是否已经是中文，用于跳过无意义的翻译请求。
@@ -179,31 +183,6 @@ window.__ModuleLoader__.load({
         out += ' ' + (child.textContent || '');
       }
       return (out.trim() !== '' ? out : root.textContent || '').replace(/\s+/g, ' ').trim();
-    }
-
-    /**
-     * 找到承载摘要文本的文本节点（沿第一个非装饰元素逐层下降）。
-     * @param textHost - 预览/摘要容器。
-     * @returns 文本节点，或结构不匹配时的 null。
-     */
-    function summaryTextNode(textHost) {
-      let node = textHost;
-      for (let depth = 0; depth < 6; depth += 1) {
-        let next = null;
-        for (const child of node.childNodes) {
-          if (child.nodeType === 3) {
-            if ((child.nodeValue || '').trim() !== '') return child;
-            continue;
-          }
-          if (child.nodeType !== 1) continue;
-          if (child.getAttribute('aria-hidden') === 'true' || child.hasAttribute('inert')) continue;
-          next = child;
-          break;
-        }
-        if (next === null) return null;
-        node = next;
-      }
-      return null;
     }
 
     /**
@@ -252,6 +231,10 @@ window.__ModuleLoader__.load({
           observed: new WeakSet(),
           /** 成功替换的行数（含重复替换），仅用于诊断。 */
           paintedCount: 0,
+          /** 成功换成译文的工具行数。 */
+          toolPaintedCount: 0,
+          /** 在飞的翻译请求数。 */
+          active: 0,
           /** 成功改写成中文标签的工具行数，仅用于诊断。 */
           rewrittenCount: 0,
           /** 已经报告过的失败原因，避免刷日志。 */
@@ -367,8 +350,13 @@ window.__ModuleLoader__.load({
           return task;
         }
 
-        /** 把译文插到预览容器里，并隐藏原文节点（不删除，React 仍可正常更新它）。 */
-        function paint(parts, translated) {
+        /**
+         * 把译文插到预览容器里，并隐藏原文节点（不删除，React 仍可正常更新它）。
+         * @param parts - 预览/摘要容器与原文节点。
+         * @param translated - 译文。
+         * @param original - 原文；给定时挂到 title 上，悬停即看原文。
+         */
+        function paint(parts, translated, original) {
           const { summary, textHost } = parts;
           let own = null;
           for (const child of summary.children) {
@@ -381,8 +369,75 @@ window.__ModuleLoader__.load({
             summary.appendChild(own);
           }
           own.textContent = translated;
+          if (original !== undefined) own.title = original;
           textHost.setAttribute(HIDDEN_ATTR, '');
           state.paintedCount += 1;
+        }
+
+        /**
+         * 把一整行工具缩略送去翻译。
+         * 成功：隐藏原文、显示译文，原文挂在 `title` 上（悬停即看原文），
+         * 展开行里的 IN 参数仍是原始 JSON，命令随时可复制。
+         * 失败：退回「只换中文工具名标签」，至少不再是纯英文。
+         * @param row - 带 data-tool 的工具行根节点。
+         */
+        function syncToolRow(row) {
+          if (state.disposed) return;
+          const parts = queryParts(row);
+          if (parts === null) { rewriteToolSummary(row); return; }
+          const text = readSummary(parts.textHost);
+          if (text === '') return;
+          if (looksChinese(text)) return;
+          if (state.painted.get(row) === text) return;
+          const cooldownUntil = state.failures.get(text);
+          if (cooldownUntil !== undefined) {
+            if (Date.now() < cooldownUntil) { rewriteToolSummary(row); return; }
+            state.failures.delete(text);
+          }
+          const previous = state.lastSeen.get(row);
+          state.lastSeen.set(row, text);
+          const pending = state.timers.get(row);
+          if (pending !== undefined) {
+            if (previous === text) return;
+            clearTimeout(pending);
+          }
+          const toolState = row.getAttribute('data-state');
+          const running = toolState === 'running' || toolState === 'preparing';
+          const timer = setTimeout(() => {
+            state.timers.delete(row);
+            if (state.disposed || !row.isConnected) return;
+            const current = queryParts(row);
+            if (current === null || readSummary(current.textHost) !== text) return;
+            if (state.active >= MAX_CONCURRENT_REQUESTS) { schedule(); return; }
+            state.active += 1;
+            resolveTranslation(text).then((translated) => {
+              if (state.disposed || !row.isConnected) return;
+              const fresh = queryParts(row);
+              if (fresh === null || readSummary(fresh.textHost) !== text) return;
+              paint(fresh, translated, text);
+              state.painted.set(row, text);
+              state.toolPaintedCount += 1;
+            }).catch((error) => {
+              state.failures.set(text, Date.now() + RETRY_AFTER_MS);
+              state.meta = undefined;
+              rewriteToolSummary(row);
+              const reason = error && error.message ? error.message : String(error);
+              report('tool-translate-failed: ' + reason, {
+                textLength: text.length,
+                session: typeof state.sessionId === 'string' && state.sessionId !== '',
+              });
+            }).finally(() => { state.active -= 1; });
+          }, running ? STREAM_DEBOUNCE_MS : 0);
+          state.timers.set(row, timer);
+        }
+
+        /** 工具行的视口观察，与思考行共用同一套可见性跟踪。 */
+        function observeToolRow(row) {
+          if (!state.observed.has(row)) {
+            state.observed.add(row);
+            if (intersection !== null) intersection.observe(row);
+          }
+          if (intersection === null || visible.has(row)) syncToolRow(row);
         }
 
         /** 还原一行：移除译文节点，取消隐藏。 */
@@ -396,9 +451,10 @@ window.__ModuleLoader__.load({
         /**
          * 把工具折叠行里的英文 wire 工具名换成中文标签。
          *
-         * 只动文本节点里的工具名前缀：DSH 对未登记的工具拼出 `toolName · <参数摘要>`，
-         * 已知工具（bash/read/grep…）的摘要里没有工具名，因此天然不会被改到。
-         * 参数部分（命令、路径、query）一个字符都不改，仍然可复制可直接用。
+         * 不依赖 DOM 结构：直接遍历这一行自己的文本节点，找以 `<工具名> · ` 开头的那一个改掉。
+         * DSH 对未登记的工具拼出 `toolName · <参数摘要>`；已知工具（bash/read/grep…）的摘要里
+         * 没有工具名，因此天然不会被改到。参数部分（命令、路径、query）一个字符都不改，
+         * 仍然可复制可直接用。
          * @param row - 带 data-tool 的工具行根节点。
          */
         function rewriteToolSummary(row) {
@@ -407,20 +463,22 @@ window.__ModuleLoader__.load({
           if (typeof toolName !== 'string' || toolName === '') return;
           const label = toolLabel(toolName);
           if (label === toolName) return;
-          const parts = queryParts(row);
-          if (parts === null) return;
-          const text = readSummary(parts.textHost);
-          if (text === '') return;
           const prefix = toolName + ' · ';
-          let next;
-          if (text === toolName) next = label;
-          else if (text.startsWith(prefix)) next = label + ' · ' + text.slice(prefix.length);
-          else return;
-          const node = summaryTextNode(parts.textHost);
-          if (node === null) return;
-          if (node.nodeValue === next) return;
-          node.nodeValue = next;
-          state.rewrittenCount += 1;
+          // 4 = NodeFilter.SHOW_TEXT；用常量避免依赖 window.NodeFilter。
+          const walker = document.createTreeWalker(row, 4);
+          for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+            const value = node.nodeValue || '';
+            const offset = value.length - value.trimStart().length;
+            const body = value.slice(offset);
+            let next;
+            if (body.startsWith(prefix)) next = value.slice(0, offset) + label + ' · ' + body.slice(prefix.length);
+            else if (body.trimEnd() === toolName) next = value.slice(0, offset) + label;
+            else continue;
+            if (node.nodeValue === next) return;
+            node.nodeValue = next;
+            state.rewrittenCount += 1;
+            return;
+          }
         }
 
         /** 安排一次翻译：等待文本稳定、去重、失败冷却都在这里。 */
@@ -455,7 +513,7 @@ window.__ModuleLoader__.load({
               if (state.disposed || !row.isConnected) return;
               const fresh = queryParts(row);
               if (fresh === null || readSummary(fresh.textHost) !== text) return;
-              paint(fresh, translated);
+              paint(fresh, translated, text);
               state.painted.set(row, text);
             }).catch((error) => {
               state.failures.set(text, Date.now() + RETRY_AFTER_MS);
@@ -487,7 +545,7 @@ window.__ModuleLoader__.load({
             observeRow(row);
           }
           for (const row of document.querySelectorAll(TOOL_ROW_SELECTOR)) {
-            rewriteToolSummary(row);
+            observeToolRow(row);
           }
         }
 
@@ -513,20 +571,29 @@ window.__ModuleLoader__.load({
           });
         }
 
-        /** 工具行存在且有可用映射、却一行都没改写成功时，报告卡在哪一步。 */
+        /**
+         * 报告仍然显示英文的工具行：说明翻译没成功、也没退回到中文标签。
+         * 只在确实有漏网行时输出，健康的页面上不会触发。
+         */
         function diagnoseTools() {
-          if (state.disposed || state.rewrittenCount > 0) return;
+          if (state.disposed) return;
           const rows = Array.from(document.querySelectorAll(TOOL_ROW_SELECTOR));
           if (rows.length === 0) return;
-          let mapped = 0;
-          let withSeparator = 0;
+          const pending = [];
           for (const row of rows) {
-            const name = row.getAttribute('data-tool');
-            if (typeof name === 'string' && toolLabel(name) !== name) mapped += 1;
-            if (row.querySelector(SEPARATOR_SELECTOR) !== null) withSeparator += 1;
+            const parts = queryParts(row);
+            if (parts === null) continue;
+            const text = readSummary(parts.textHost);
+            if (text === '' || looksChinese(text)) continue;
+            if (state.painted.get(row) === text) continue;
+            pending.push((row.getAttribute('data-tool') || '?') + '|' + text.slice(0, 30));
           }
-          if (mapped === 0) return;
-          report('no-tool-label-applied', { rows: rows.length, mapped, separators: withSeparator });
+          if (pending.length === 0) return;
+          report('tool-rows-untranslated', {
+            rows: rows.length,
+            translated: state.toolPaintedCount,
+            pending: pending.slice(0, 6),
+          });
         }
 
         // 仅隐藏原文的样式；译文节点复用原文的类名，因此排版完全一致。
@@ -540,7 +607,8 @@ window.__ModuleLoader__.load({
             for (const entry of entries) {
               if (entry.isIntersecting) {
                 visible.add(entry.target);
-                syncRow(entry.target);
+                if (entry.target.hasAttribute('data-tool')) syncToolRow(entry.target);
+                else syncRow(entry.target);
               } else {
                 visible.delete(entry.target);
               }
