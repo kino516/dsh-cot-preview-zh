@@ -1,0 +1,12 @@
+# 一并启用随 dsh 发布的翻译服务（解析自安装目录，不额外声明依赖），
+# 再插入本插件：折叠预览的展示层翻译。
+- insert:
+    - id: translator
+      name: '@deepseek-ai/dsh-experimental-translator'
+    - id: cot-translation
+      name: '@deepseek-ai/dsh-experimental-client-ui-cot-translation'
+      config:
+        provider: bing
+        targetLanguage: auto
+    - id: cot-preview-zh
+      name: dsh-cot-preview-zh

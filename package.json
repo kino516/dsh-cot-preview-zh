@@ -1,0 +1,53 @@
+{
+  "name": "dsh-cot-preview-zh",
+  "version": "1.0.0",
+  "private": true,
+  "description": "翻译 DSH（DeepSeek Harness）折叠状态下的思考预览行：复用官方 cot-translation 的 Host 翻译服务，只补 UI 层的预览替换。",
+  "license": "MIT",
+  "author": "kino516",
+  "homepage": "https://github.com/kino516/dsh-cot-preview-zh#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kino516/dsh-cot-preview-zh.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kino516/dsh-cot-preview-zh/issues"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "translation",
+    "reasoning",
+    "chain-of-thought"
+  ],
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-chat",
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-experimental-client-ui-cot-translation"
+      ]
+    }
+  }
+}
