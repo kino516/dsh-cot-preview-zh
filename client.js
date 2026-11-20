@@ -12,6 +12,8 @@
  *   · 流式思考等文本稳定 700ms 再翻；命中缓存/在途请求不重复发；
  *   · 翻译失败保留英文原文，5 分钟内不重试；
  *   · 原文节点只是被隐藏，随时可还原；卸载时全部还原并断开观察；
+ *   · 工具折叠行走另一条路：只把 `data-tool` 里的英文 wire 工具名换成中文标签
+ *     （`工具 · ops_bash · ls -la` → `执行命令 · ls -la`），参数/命令/路径一个字符都不改；
  *   · 3 秒后仍没有任何一行翻译成功时，打一条 error 级诊断（DSH 桌面端会把渲染进程的
  *     error 级 console 转发到 ~/.dsh/logs/desktop-next.log），便于定位是缺 sessionId、
  *     还是没匹配到思考行/预览锚点。健康的页面上不会输出这条诊断。
@@ -33,6 +35,108 @@ window.__ModuleLoader__.load({
     const HIDDEN_ATTR = 'data-cot-preview-zh-hidden';
     /** 注入的样式表 id。 */
     const STYLE_ID = 'dsh-cot-preview-zh-style';
+    /** 工具行根节点带 data-tool="<wire tool name>"。 */
+    const TOOL_ROW_SELECTOR = '[data-tool]';
+
+    /**
+     * 工具名 → 中文标签。
+     *
+     * 只替换折叠行里的**工具名前缀**（DSH 对未登记的工具会把 wire 名拼进摘要，
+     * 见 `dsh-client-ui-tool` 的 `tool-call-model.ts`：`summary = [generic ? toolName : '', base].join(' · ')`）。
+     * 参数、命令、路径、query 一律原样保留——机翻它们会破坏可复制性，甚至让命令失真。
+     */
+    const TOOL_LABELS = {
+      ops_bash: '执行命令',
+      ops_inspect_local_file: '读取文件',
+      ops_grep: '搜索内容',
+      ops_glob: '查找文件',
+      plugin_manager: '插件管理',
+      skill: '加载技能',
+      todo_write: '记录待办',
+      ask_user_question: '询问用户',
+      present: '交付文件',
+      write: '写入文件',
+      edit: '编辑文件',
+      get_goal: '读取目标',
+      create_goal: '创建目标',
+      update_goal: '更新目标',
+      load_workspace_dependencies: '加载工作区依赖',
+      windows_encode_detect: '诊断文件编码',
+      windows_encode_fix: '修复文件编码',
+      web_search: '网络搜索',
+      web_fetch: '抓取网页',
+      job_list: '列出后台任务',
+      job_output: '读取任务输出',
+      job_kill: '停止任务',
+      terminal_open: '打开终端',
+      terminal_read: '读取终端',
+      terminal_send: '向终端输入',
+      terminal_signal: '发送信号',
+      terminal_close: '关闭终端',
+      terminal_list: '列出终端',
+      subagent: '派发子代理',
+      subagent_fork: '派发子代理（继承上下文）',
+      subagent_oar: '派发外部代理',
+      list_agents: '列出代理',
+      send_message: '给代理发消息',
+      wait_agent: '等待代理',
+      workflow: '运行工作流',
+      schedule_create: '新建定时任务',
+      schedule_edit: '编辑定时任务',
+      schedule_list: '列出定时任务',
+      schedule_view: '查看定时任务',
+      remote_list_hosts: '列出远程主机',
+      remote_list_workspaces: '列出远程工作区',
+      remote_list_sessions: '列出远程会话',
+      remote_list_presets: '列出远程预设',
+      remote_select_preset: '选择远程预设',
+      remote_create_session: '新建远程会话',
+      remote_send_message: '远程发消息',
+      remote_read_session: '读取远程会话',
+      remote_wait_sessions: '等待远程会话',
+      remote_interrupt_session: '中断远程会话',
+      remote_download_file: '下载远程文件',
+      remote_upload_file: '上传远程文件',
+      remote_get_operation: '查询远程操作',
+    };
+
+    /** 内置浏览器工具（`dsh_browser_*`）的动词标签。 */
+    const BROWSER_LABELS = {
+      open: '打开页面', refresh: '刷新页面', back: '后退', forward: '前进',
+      click: '点击', click_sequence: '连续点击', type: '输入文本', fill: '填写表单',
+      set_value: '设置字段值', clear: '清空输入', check: '勾选', select: '选择选项',
+      get_value: '读取字段值', key: '按键', hover: '悬停', drag: '拖拽', scroll: '滚动',
+      a11y: '读取无障碍树', snapshot: '读取页面结构', screenshot: '截图', content: '读取页面内容',
+      scrape: '抓取结构化数据', state: '读取页面状态', find: '页内查找', assert: '断言页面',
+      wait: '等待加载', wait_for_response: '等待响应', console: '读取控制台', network: '查看网络请求',
+      execute: '执行脚本', dialog: '处理对话框', challenge: '检查验证码', doctor: '诊断浏览器',
+      upload: '上传文件', download: '下载文件', list_tabs: '列出标签页', switch_tab: '切换标签页',
+      close_tab: '关闭标签页', session: '会话信息', reset: '重置浏览器', reset_session: '重置会话',
+      restrict: '限制工具', history: '操作历史', replay: '重放操作', visited: '访问记录',
+      help: '帮助', auth: '会话凭据',
+    };
+
+    /**
+     * 把 wire 工具名解析成中文标签。
+     * @param name - `data-tool` 的值。
+     * @returns 中文标签；没有映射时原样返回（不改动未知工具）。
+     */
+    function toolLabel(name) {
+      if (typeof name !== 'string' || name === '') return name;
+      const exact = TOOL_LABELS[name];
+      if (exact !== undefined) return exact;
+      const browser = /^dsh_browser_(.+)$/.exec(name);
+      if (browser !== null) {
+        const verb = BROWSER_LABELS[browser[1]];
+        if (verb !== undefined) return '浏览器·' + verb;
+      }
+      const ops = /^ops_(.+)$/.exec(name);
+      if (ops !== null) {
+        const same = TOOL_LABELS['ops_' + ops[1]];
+        if (same !== undefined) return same;
+      }
+      return name;
+    }
     /** 本地译文缓存条目上限。 */
     const CACHE_LIMIT = 400;
     /** 单次翻译请求的超时。 */
@@ -75,6 +179,31 @@ window.__ModuleLoader__.load({
         out += ' ' + (child.textContent || '');
       }
       return (out.trim() !== '' ? out : root.textContent || '').replace(/\s+/g, ' ').trim();
+    }
+
+    /**
+     * 找到承载摘要文本的文本节点（沿第一个非装饰元素逐层下降）。
+     * @param textHost - 预览/摘要容器。
+     * @returns 文本节点，或结构不匹配时的 null。
+     */
+    function summaryTextNode(textHost) {
+      let node = textHost;
+      for (let depth = 0; depth < 6; depth += 1) {
+        let next = null;
+        for (const child of node.childNodes) {
+          if (child.nodeType === 3) {
+            if ((child.nodeValue || '').trim() !== '') return child;
+            continue;
+          }
+          if (child.nodeType !== 1) continue;
+          if (child.getAttribute('aria-hidden') === 'true' || child.hasAttribute('inert')) continue;
+          next = child;
+          break;
+        }
+        if (next === null) return null;
+        node = next;
+      }
+      return null;
     }
 
     /**
@@ -123,6 +252,8 @@ window.__ModuleLoader__.load({
           observed: new WeakSet(),
           /** 成功替换的行数（含重复替换），仅用于诊断。 */
           paintedCount: 0,
+          /** 成功改写成中文标签的工具行数，仅用于诊断。 */
+          rewrittenCount: 0,
           /** 已经报告过的失败原因，避免刷日志。 */
           reported: new Set(),
         };
@@ -262,6 +393,36 @@ window.__ModuleLoader__.load({
           }
         }
 
+        /**
+         * 把工具折叠行里的英文 wire 工具名换成中文标签。
+         *
+         * 只动文本节点里的工具名前缀：DSH 对未登记的工具拼出 `toolName · <参数摘要>`，
+         * 已知工具（bash/read/grep…）的摘要里没有工具名，因此天然不会被改到。
+         * 参数部分（命令、路径、query）一个字符都不改，仍然可复制可直接用。
+         * @param row - 带 data-tool 的工具行根节点。
+         */
+        function rewriteToolSummary(row) {
+          if (state.disposed) return;
+          const toolName = row.getAttribute('data-tool');
+          if (typeof toolName !== 'string' || toolName === '') return;
+          const label = toolLabel(toolName);
+          if (label === toolName) return;
+          const parts = queryParts(row);
+          if (parts === null) return;
+          const text = readSummary(parts.textHost);
+          if (text === '') return;
+          const prefix = toolName + ' · ';
+          let next;
+          if (text === toolName) next = label;
+          else if (text.startsWith(prefix)) next = label + ' · ' + text.slice(prefix.length);
+          else return;
+          const node = summaryTextNode(parts.textHost);
+          if (node === null) return;
+          if (node.nodeValue === next) return;
+          node.nodeValue = next;
+          state.rewrittenCount += 1;
+        }
+
         /** 安排一次翻译：等待文本稳定、去重、失败冷却都在这里。 */
         function syncRow(row) {
           if (state.disposed) return;
@@ -318,12 +479,15 @@ window.__ModuleLoader__.load({
           if (intersection === null || visible.has(row)) syncRow(row);
         }
 
-        /** 扫描当前文档里的思考行。 */
+        /** 扫描当前文档里的思考行与工具行。 */
         function scan() {
           if (state.disposed) return;
           for (const row of document.querySelectorAll(ROW_SELECTOR)) {
             if (row.hasAttribute('data-expanded')) continue;
             observeRow(row);
+          }
+          for (const row of document.querySelectorAll(TOOL_ROW_SELECTOR)) {
+            rewriteToolSummary(row);
           }
         }
 
@@ -347,6 +511,22 @@ window.__ModuleLoader__.load({
             previewRows: preview,
             separators: document.querySelectorAll(SEPARATOR_SELECTOR).length,
           });
+        }
+
+        /** 工具行存在且有可用映射、却一行都没改写成功时，报告卡在哪一步。 */
+        function diagnoseTools() {
+          if (state.disposed || state.rewrittenCount > 0) return;
+          const rows = Array.from(document.querySelectorAll(TOOL_ROW_SELECTOR));
+          if (rows.length === 0) return;
+          let mapped = 0;
+          let withSeparator = 0;
+          for (const row of rows) {
+            const name = row.getAttribute('data-tool');
+            if (typeof name === 'string' && toolLabel(name) !== name) mapped += 1;
+            if (row.querySelector(SEPARATOR_SELECTOR) !== null) withSeparator += 1;
+          }
+          if (mapped === 0) return;
+          report('no-tool-label-applied', { rows: rows.length, mapped, separators: withSeparator });
         }
 
         // 仅隐藏原文的样式；译文节点复用原文的类名，因此排版完全一致。
@@ -410,7 +590,8 @@ window.__ModuleLoader__.load({
         });
 
         schedule();
-        const diagnoseTimers = DIAGNOSE_AT_MS.map((delay) => setTimeout(diagnose, delay));
+        const diagnoseTimers = DIAGNOSE_AT_MS.map((delay) => setTimeout(diagnose, delay))
+          .concat(DIAGNOSE_AT_MS.map((delay) => setTimeout(diagnoseTools, delay)));
 
         ctx.effect(() => () => {
           state.disposed = true;

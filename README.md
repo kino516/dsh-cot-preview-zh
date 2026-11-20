@@ -9,8 +9,31 @@
 
 ## 它解决什么
 
+插件管两处，做法完全不同：
+
+**1. 折叠的思考预览行 —— 机器翻译**
+
 官方 `@deepseek-ai/dsh-experimental-client-ui-cot-translation` 只翻「**展开后**的思考正文」。折叠时那行预览是 `dsh-client-ui-chat` 里 `ReasoningRow` 用
 `firstLine(reasoning)` / `latestCompletedParagraphFirstLine(reasoning)` 就地拼出来直接渲染的，**没有暴露任何 Slot**，所以官方插件改不到它。
+
+**2. 工具折叠行 —— 只换工具名标签，不动机翻**
+
+DSH 对**未登记的工具**会把 wire 名拼进摘要（`dsh-client-ui-tool` 的 `tool-call-model.ts`：
+`summary = [titleKey === 'tool.title.generic' ? toolName : '', base].join(' · ')`），
+于是行里出现 `工具 · ops_bash · ls -la /d/Deepseek` 这种全英文。
+
+这里**不做机器翻译**：那一行是标识符 + 命令/路径，翻它会破坏可复制性、甚至让命令失真。
+插件只把工具名前缀换成中文标签，参数原样保留：
+
+```
+工具 · ops_bash · ls -la /d/Deepseek     →  执行命令 · ls -la /d/Deepseek
+工具 · dsh_browser_screenshot · ...      →  浏览器·截图 · ...
+工具 · skill · dsh-doc                   →  加载技能 · dsh-doc
+工具 · bash · 列出目录                   →  工具 · bash · 列出目录   （已知工具本就有中文标题，不动）
+```
+
+映射表在 `client.js` 顶部（`TOOL_LABELS` / `BROWSER_LABELS`），按 `dsh_browser_*` 动词族做了兜底；
+没有映射的未知工具**保持原样**，不猜。
 
 本插件在展示层补这一层：
 
@@ -37,6 +60,7 @@
 ## 行为
 
 - 只处理非展开、确实在显示预览的思考行（`[data-variant="think"][data-preview]`）。
+- 工具行只改工具名前缀：找不到对应映射、或该工具本就有中文标题时不碰 DOM。
 - 已经是中文的预览不送翻译请求。
 - 流式思考等文本稳定 700ms 再翻；同文本命中缓存或在途请求不重复发。
 - 失败保留英文原文，同一段文本 5 分钟内不重试。
